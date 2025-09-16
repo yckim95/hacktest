@@ -1,0 +1,1060 @@
+project:
+  name: 비대면 채용 면접 시스템 (Next.js + Supabase Storage, 파일 기반)
+  description: Next.js 14(App Router, TypeScript)와 Supabase Storage만을 사용해 DB 없이 모든 상태/메타/로그/미디어를 파일로 관리하는 비대면 채용 면접 시스템.
+    지원자 플로우(로그인→장치점검/동의→오프닝/질문 진행→종료 제출), 관리자 플로우(라운드 생성/질문 업로드/지원자 등록/초대 발송/상태 보드/결과 열람/LLM 평가), WS 기반 연속녹화(WebM) 및
+    FFmpeg remux, 실시간 STT(Web Speech API 1순위, Whisper 폴백), 파일 무결성/원자적 쓰기/로그(JSONL) 구현. 고유 10자리 토큰을 URL/디렉토리/파일 접두로 일관
+    사용.
+tasks:
+  - id: setup-env-structure
+    title: 프로젝트 초기 구조/환경 변수 검증
+    priority: P0
+    description: 프로젝트 폴더 구조 생성, 필수 환경변수 스키마 정의 및 부트 시 검증. Docker 실행 스크립트 골격 포함. HTTPS/HSTS 전제 문서화.
+    files:
+      - path: scripts/ops/docker-compose.yml
+        description: 개발/운영용 Docker 컴포즈 템플릿
+        type: create
+      - path: scripts/ops/start.sh
+        description: Next.js + ws 서버 단일 프로세스 부트 스크립트
+        type: create
+      - path: /lib/validators/schemas.ts
+        description: 환경변수 및 공통 요청 스키마 정의(zod)
+        type: create
+    subtasks:
+      - id: setup-env-validate
+        title: 환경변수 스키마 정의 및 런타임 검증
+        description: SUPABASE_URL/SERVICE_KEY, SMTP_*, ADMIN_*, OPENAI_API_KEY, APP_BASE_URL 등 유효성 검사. 부트 실패시 명확한 에러 메시지로 종료.
+        category: setup
+        implementation_notes:
+          - zod로 .env 파싱, 누락/형식오류 시 process.exit(1)
+          - APP_BASE_URL는 절대 URL, https 스킴 체크
+      - id: setup-folders
+        title: 폴더 스캐폴드 생성
+        description: TRD의 프로젝트 폴더 구조를 빈 파일로 생성하여 빌드/임포트 오류 제거.
+        category: setup
+        implementation_notes:
+          - 빈 index.ts/route.ts 파일 배치
+          - .gitkeep 사용
+    completion_criteria:
+      - 로컬 부트 시 환경변수 미설정 항목에 대해 친절한 오류로 즉시 종료
+      - 폴더 구조 기준 모든 import 경로 해소(빌드 성공)
+    risks:
+      - risk: 환경변수 누락으로 런타임 추적 어려움
+        mitigation: 부트 타임 강제 검증 + 요구 목록 문서화
+    order: 1
+  - id: lib-supabase-adapter
+    title: 스토리지 어댑터 구현(Supabase R/W/목록/원자적 쓰기)
+    priority: P0
+    description: Supabase Storage 전용 어댑터. 파일 읽기/쓰기/목록/존재확인/무결성(sha256, size)/경로 규칙/임시파일(.tmp)→move 원자화. JSON/JSONL 유틸 포함.
+    files:
+      - path: /lib/storage/supabaseClient.ts
+        description: 서비스 키 기반 Supabase 클라이언트 초기화(서버 전용)
+        type: create
+      - path: /lib/storage/storageAdapter.ts
+        description: 원자적 업로드/다운로드/목록/해시/크기 검증, .tmp 업로드 후 move
+        type: create
+    subtasks:
+      - id: lib-path-rules
+        title: 경로 규칙/빌더
+        description: recruitments/{id}/..., candidates/{token}/... 경로 생성기와 유효성 검사(토큰 10자리, 파일 접두)
+        category: data
+        implementation_notes:
+          - 정규식 /^[A-Za-z0-9]{10}$/ 검증
+          - 모든 write는 접두 candidateToken_ 강제
+      - id: lib-atomic-write
+        title: 원자적 쓰기/무결성
+        description: upload(tmp)→etag/size 검증→move(final). JSON은 UTF-8, 끝줄 개행. JSON 스키마 검증 실패 시 업로드 중단.
+        category: data
+        implementation_notes:
+          - 해시 계산 후 metadata 저장
+          - move API 사용, 실패 시 롤백 삭제
+      - id: lib-jsonl-append
+        title: JSONL 세그먼트 방식 append
+        description: append가 불가한 스토리지 특성 보완 위해 logs/* 에 세그먼트 파일 0001.jsonl 등으로 업로드 후 필요 시 머지.
+        category: data
+        implementation_notes:
+          - 세그먼트 인덱스는 스토리지 목록 길이+1
+          - finish 시 세그먼트 합쳐 단일 파일 생성
+    dependencies:
+      - setup-env-structure
+    completion_criteria:
+      - 쓰기 시 .tmp 생성 후 최종 경로로 move 수행
+      - 업로드 후 size/sha256 메타 저장 및 검증 통과
+      - 경로 규칙 위반 시 400 오류 반환
+    risks:
+      - risk: Supabase move 동작 원자성 보장 한계
+        mitigation: 클라이언트 재시도 시 idempotency 키로 중복 업로드 방지, move 실패 시 .tmp 정리 재시도 큐
+    order: 2
+  - id: lib-crypto-identifiers
+    title: 식별자/암호화 유틸 구현(token10, PIN argon2)
+    priority: P0
+    description: 랜덤 10자리 token 생성기(충돌 낮춤), PIN 해시/검증 유틸(argon2). 고유 토큰 엔트로피 확인.
+    files:
+      - path: /lib/auth/crypto.ts
+        description: token10(), pinHash(), pinVerify()
+        type: create
+    subtasks:
+      - id: token10-gen
+        title: token10 생성기
+        description: 62진수 10자리. 충돌확률 샘플 테스트.
+        category: core
+        implementation_notes:
+          - crypto.getRandomValues/Node crypto.randomBytes 기반
+          - 중복 여부는 스토리지 존재 체크로 보조
+      - id: pin-argon2
+        title: PIN 해시/검증
+        description: argon2id, 적절한 메모리/시간 파라미터 설정. 해시만 저장.
+        category: core
+        implementation_notes:
+          - 환경에 맞는 cost 파라미터 문서화
+          - 타임상수 비교
+    dependencies:
+      - setup-env-structure
+    completion_criteria:
+      - 100만회 샘플링 충돌=0(테스트 시뮬레이션)
+      - PIN 해시/검증 라운드트립 성공
+    risks:
+      - risk: 과도한 argon2 비용으로 인증 지연
+        mitigation: 벤치마크 후 비용 조정, 서버 스레드풀 모니터링
+    order: 3
+  - id: lib-session-rate-limit
+    title: 세션(iron-session)과 메모리 토큰버킷 레이트리미터
+    priority: P0
+    description: 지원자/관리자 세션 발급/검증 유틸. IP/토큰별 토큰 버킷(단일 노드 메모리) 구현 및 공통 미들웨어.
+    files:
+      - path: /lib/auth/session.ts
+        description: iron-session 설정/발급/검증 헬퍼
+        type: create
+      - path: /lib/rateLimit/memory.ts
+        description: 토큰 버킷(rate, burst) 및 키 전략(IP, token)
+        type: create
+    subtasks:
+      - id: iron-session-config
+        title: iron-session 설정
+        description: 쿠키 Secure/HttpOnly/SameSite=Lax, TTL 설정. applicant/admin 분리 키.
+        category: core
+        implementation_notes:
+          - APP_BASE_URL 기반 쿠키 도메인 설정
+          - 서버 전용 import 보장
+      - id: rate-limit-mw
+        title: 레이트리미터 미들웨어
+        description: 로그인/민감 API에 적용. 429 공통 에러 포맷.
+        category: core
+        implementation_notes:
+          - 버킷 리필 주기 1s, 버스트 10/min 기본
+          - "키: `${ip}:${path}` 또는 `${token}:${path}`"
+    dependencies:
+      - setup-env-structure
+    completion_criteria:
+      - 세션 발급/검증 유틸 E2E 통과
+      - 429 응답 및 헤더로 잔여 토큰 노출
+    risks:
+      - risk: 다중 인스턴스 시 메모리 리미터 불일치
+        mitigation: 운영 가이드에 L7 레이트리미팅 권고 및 단일 인스턴스 전제 명시
+    order: 4
+  - id: api-auth-applicant
+    title: 지원자 로그인 API 구현
+    priority: P0
+    description: POST /api/auth/applicant/login. token+pin 검증, status.json loginFailedCount 증가/초기화, 5회 실패 시 state=locked, 세션 발급.
+    files:
+      - path: /app/api/auth/applicant/login/route.ts
+        description: 로그인 핸들러
+        type: create
+    subtasks:
+      - id: auth-applicant-verify
+        title: token/pin 검증
+        description: candidates/{token}/meta.json, status.json 로드, pinHash 대조.
+        category: api
+        implementation_notes:
+          - 상태=locked 시 409 반환
+          - 로그에 평문 PIN 금지
+      - id: auth-applicant-update-status
+        title: 실패 카운터/상태 업데이트
+        description: 실패 시 loginFailedCount+1 및 상태 변경, 성공 시 0으로 리셋 및 lastLoginAt 기록.
+        category: data
+        implementation_notes:
+          - 원자적 쓰기로 status.json 업데이트
+    dependencies:
+      - lib-supabase-adapter
+      - lib-crypto-identifiers
+      - lib-session-rate-limit
+    completion_criteria:
+      - 5회 실패 후 state=locked 반영
+      - 세션 쿠키에 {token, role:"applicant"} 설정
+    risks:
+      - risk: 연속 쓰기 충돌로 status.json 손상
+        mitigation: 임시파일 업로드+move, ETag 비교 실패 시 재시도
+    order: 5
+  - id: api-auth-admin
+    title: 관리자 로그인 API 구현
+    priority: P0
+    description: POST /api/auth/admin/login. .env의 ADMIN_EMAIL/ADMIN_PASSWORD_HASH 기반 검증 후 세션 발급.
+    files:
+      - path: /app/api/auth/admin/login/route.ts
+        description: 관리자 로그인 핸들러
+        type: create
+    subtasks:
+      - id: admin-cred-verify
+        title: 관리자 자격 검증
+        description: 이메일 일치 및 비밀번호 argon2 검증.
+        category: api
+        implementation_notes:
+          - 실패 메시지 일반화(보안)
+    dependencies:
+      - lib-crypto-identifiers
+      - lib-session-rate-limit
+    completion_criteria:
+      - 정상 로그인 시 세션{role:admin} 발급
+      - 실패 시 표준 에러 포맷 반환
+    risks:
+      - risk: 환경변수 오설정
+        mitigation: 부트 시 해시 유효성 검증
+    order: 6
+  - id: api-recruitments-create-upload
+    title: 채용 생성/공통 질문 업로드 API
+    priority: P0
+    description: POST /api/admin/recruitments. busboy로 멀티파트 파싱, meta.json 생성, common_questions/1~3 업로드, openingVideo 선택적 업로드.
+    files:
+      - path: /app/api/admin/recruitments/route.ts
+        description: 채용 생성/업로드 핸들러
+        type: create
+      - path: /lib/validators/schemas.ts
+        description: 입력 스키마에 recruitments 생성 검증 추가
+        type: modify
+    subtasks:
+      - id: recruitments-meta
+        title: meta.json 작성
+        description: "{ id, name, description, createdAt, retentionMonths, languagePolicy, openingVideoPath?, ownerEmail }"
+        category: data
+        implementation_notes:
+          - id는 caller 제공 또는 UUID
+          - 경로 빌더 사용
+      - id: video-upload-validate
+        title: 비디오 업로드/검증
+        description: MIME/확장자(mp4|webm) 검증, 파일 크기 제한, 해시/크기 메타 저장.
+        category: api
+        implementation_notes:
+          - pre-signed URL 미사용, 서버 경유 업로드
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - meta.json 존재 및 JSON 검증 통과
+      - common_questions/1~3 업로드 완료
+    risks:
+      - risk: 대용량 업로드 중 메모리 초과
+        mitigation: 버퍼링 없이 스트리밍 업로드, 사이즈 제한
+    order: 7
+  - id: api-candidates-batch-invite
+    title: 지원자 등록/일괄 업로드 + 초대 이메일 발송
+    priority: P0
+    description: POST /api/admin/candidates/batch. CSV/JSON 파싱, token/pin 생성, meta/status 생성, 초대 이메일 발송 및 결과 반환.
+    files:
+      - path: /app/api/admin/candidates/batch/route.ts
+        description: 배치 등록 핸들러
+        type: create
+      - path: /lib/email/mailer.ts
+        description: Nodemailer + SMTP 핸들러 및 handlebars 템플릿 렌더
+        type: create
+      - path: /config/email-templates/invitation.hbs
+        description: 초대 메일 템플릿
+        type: create
+    subtasks:
+      - id: parse-csv-json
+        title: 입력 파싱/검증
+        description: CSV/JSON 지원, number/name/email 필수.
+        category: api
+        implementation_notes:
+          - 중복 이메일/number 허용정책 문서화
+      - id: create-candidate-files
+        title: meta/status 파일 생성
+        description: candidates/{token}/meta.json, status.json 초기화, linkUrl 포함.
+        category: data
+        implementation_notes:
+          - pinHash 저장, state=not_started
+      - id: send-email
+        title: 초대 이메일 발송/로그
+        description: SMTP 전송, 결과를 events.jsonl 세그먼트로 기록.
+        category: api
+        implementation_notes:
+          - 반송/실패 사유 로깅
+    dependencies:
+      - lib-supabase-adapter
+      - lib-crypto-identifiers
+    completion_criteria:
+      - 응답에 {token,pin(평문)} 포함, 이메일 전송 결과 배열 반환
+      - 스토리지에 meta/status 생성 확인
+    risks:
+      - risk: 메일 발송 실패/지연
+        mitigation: 재시도 큐/지수 백오프, 실패 로그 대시보드 노출
+    order: 8
+  - id: api-candidate-individual-question
+    title: 개별 질문 업로드 API
+    priority: P1
+    description: POST /api/admin/candidates/:token/individual-question. 파일 검증 후 candidates/{token}/individual_question 업로드.
+    files:
+      - path: /app/api/admin/candidates/[token]/individual-question/route.ts
+        description: 개별질문 업로드 핸들러
+        type: create
+    subtasks:
+      - id: validate-candidate-exists
+        title: 지원자 존재/상태 확인
+        description: meta/status 확인, locked/error 상태 시 409.
+        category: api
+        implementation_notes:
+          - 경로 빌더 사용
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - 업로드 성공 및 메타 기록
+      - 파일 경로 반환
+    risks:
+      - risk: 잘못된 포맷 업로드
+        mitigation: MIME/코덱 제한 및 서버 재리뮤즈 옵션 제공
+    order: 9
+  - id: api-get-recruitment
+    title: 채용 리소스 조회 API
+    priority: P0
+    description: GET /api/recruitments/:id. meta.json과 질문 파일 경로 목록 리턴.
+    files:
+      - path: /app/api/recruitments/[id]/route.ts
+        description: 리크루트먼트 조회 핸들러
+        type: create
+    subtasks:
+      - id: list-common-questions
+        title: 공통 질문 목록화
+        description: common_questions/ 디렉토리 스캔, 1~3 파일 존재 확인.
+        category: api
+        implementation_notes:
+          - 존재하지 않으면 404
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - 정상 응답에 meta + 질문 경로 배열 포함
+    risks:
+      - risk: 스토리지 목록 지연
+        mitigation: 단기 캐시(메모리) 30s
+    order: 10
+  - id: api-get-candidate-summary
+    title: 지원자 요약 조회 API
+    priority: P0
+    description: GET /api/candidates/:token/summary. meta/status 요약, 파일 존재 여부. 세션 권한 검사(관리자/본인).
+    files:
+      - path: /app/api/candidates/[token]/summary/route.ts
+        description: 지원자 요약 핸들러
+        type: create
+    subtasks:
+      - id: authz-check
+        title: 권한 검사
+        description: 관리자 세션 또는 동일 토큰 세션만 접근.
+        category: api
+        implementation_notes:
+          - iron-session 검사
+    dependencies:
+      - lib-supabase-adapter
+      - lib-session-rate-limit
+    completion_criteria:
+      - 요약 정보와 아티팩트 존재 여부 반환
+    risks:
+      - risk: 권한 누락으로 정보 노출
+        mitigation: 서버 측 강제 권한 검사, 상세 오류 숨김
+    order: 11
+  - id: ws-server-recording
+    title: WS 녹화 서버(append + remux 업로드)
+    priority: P0
+    description: /ws/record/:token. 헤더 수신→로컬 tmp 파일 append→종료 시 FFmpeg remux→원본/리뮤즈드 업로드→tmp 삭제. 순서/오프셋 보장, 중단 처리.
+    files:
+      - path: /server/ws/index.ts
+        description: ws 서버 초기화 및 세션별 핸들
+        type: create
+      - path: /lib/ffmpeg/remux.ts
+        description: ffmpeg-static을 통한 remux 유틸(컨테이너 정합성)
+        type: create
+      - path: /server/jobs/ffmpegQueue.ts
+        description: remux 작업 큐(in-memory)
+        type: create
+    subtasks:
+      - id: ws-handshake-validate
+        title: 헤더 검증/세션 단일화
+        description: "{token, codec, width, height, fps, bitrate} 검증, 동일 토큰 동시 세션 차단."
+        category: core
+        implementation_notes:
+          - 세션 맵으로 중복 차단
+      - id: append-chunks
+        title: 청크 append/flush
+        description: 1s 청크를 순서대로 파일에 append. 오류 시 즉시 세션 종료.
+        category: core
+        implementation_notes:
+          - 백프레셔 처리, 파일 핸들 플러시
+      - id: remux-upload
+        title: 종료 시 remux/업로드
+        description: 로컬 tmp→remuxed.webm, 원본 recording.webm 업로드, 로컬 삭제.
+        category: core
+        implementation_notes:
+          - 무결성 검증 후 업로드
+          - 업로드 경로 candidates/{token}/interview/
+      - id: interruption-mark
+        title: 네트워크 중단 처리
+        description: 비정상 close 시 현재까지 파일은 유효, status=interrupted 기록.
+        category: core
+        implementation_notes:
+          - events.jsonl 세그먼트 기록
+    dependencies:
+      - lib-supabase-adapter
+      - api-auth-applicant
+    completion_criteria:
+      - 5분 테스트 녹화 손실 0, remuxed.webm 재생 정상
+      - 중단 시 state=interrupted 반영
+    risks:
+      - risk: FFmpeg remux 실패
+        mitigation: -c copy 재리뮤즈 재시도, 실패 시 오류 로그 및 관리자 알림
+      - risk: WS 백프레셔로 프레임 드랍
+        mitigation: 청크 큐/임계치 설정 및 경고 로그
+    order: 12
+  - id: ui-applicant-flow
+    title: 지원자 UI 플로우(로그인→랜딩→플레이어)
+    priority: P0
+    description: /app/i/[token] 구현. 장치점검/동의, 오프닝/질문 플레이어, 순서 가드, WS 송신 트리거. xstate(선택) 상태머신 반영.
+    files:
+      - path: /app/i/[token]/page.tsx
+        description: 지원자 엔트리/라우팅
+        type: create
+      - path: /components/interview/Player.tsx
+        description: 오프닝/질문 재생 컨트롤러
+        type: create
+      - path: /components/interview/DeviceCheck.tsx
+        description: 장치/권한 점검 UI
+        type: create
+    subtasks:
+      - id: state-guards
+        title: 상태/가드 구현
+        description: opening→q1→... 순서 강제, 미완료 단계 버튼 비활성.
+        category: ui
+        implementation_notes:
+          - xstate 또는 React state + 가드 함수
+      - id: video-preload
+        title: 질문 영상 로딩 최적화
+        description: preload=metadata 및 range 요청 지원.
+        category: ui
+        implementation_notes:
+          - 에러 시 1회 재시도
+    dependencies:
+      - api-get-recruitment
+      - api-auth-applicant
+    completion_criteria:
+      - 상태머신 전이 제약 준수
+      - 영상 로딩 실패 시 재시도 및 안내 표시
+    risks:
+      - risk: 브라우저 호환성 문제
+        mitigation: 크롬/엣지 최신 우선, 폴리필 문서화
+    order: 13
+  - id: ui-timer-worker
+    title: 90초 타이머(Web Worker, ±0.2s)
+    priority: P0
+    description: Worker 기반 카운트다운 90s, tick=100ms, 0s 시점 시각/청각 알림. marks.json에 timer 로그 반영.
+    files:
+      - path: /components/interview/Timer.tsx
+        description: 타이머 UI/알림
+        type: create
+      - path: /public/workers/timerWorker.js
+        description: Web Worker 스크립트(드리프트 보정)
+        type: create
+    subtasks:
+      - id: drift-correction
+        title: 드리프트 보정
+        description: performance.now 기반, 누적 오차 보정.
+        category: ui
+        implementation_notes:
+          - tick마다 목표 시각 대비 보정
+      - id: timer-logging
+        title: 타이머 마킹 전송
+        description: timer_start/timer_end 마크를 /api/interview/:token/mark 에 전송.
+        category: ui
+        implementation_notes:
+          - 0s 알림 시 진동/비프 트리거
+    dependencies:
+      - ui-applicant-flow
+      - api-interview-mark
+    completion_criteria:
+      - 측정 오차 ±0.2s 내
+      - timer 로그 서버 수신 확인
+    risks:
+      - risk: 백그라운드 탭 스로틀링
+        mitigation: Worker + visibilitychange 시 보정
+    order: 14
+  - id: media-recorder-client
+    title: 녹화 클라이언트(MediaRecorder→WS)
+    priority: P0
+    description: getUserMedia(720p/30fps)→MediaRecorder(VP8/OPUS, timeslice=1000)→/ws/record/:token 전송. 시작/종료 제어 및 에러 핸들.
+    files:
+      - path: /lib/media/wsClient.ts
+        description: WS 클라이언트 유틸(헤더 송신/청크 전송)
+        type: create
+    subtasks:
+      - id: media-start-stop
+        title: Q1 시작/종료 제어
+        description: q1 시작 시 start, q4 종료 또는 종료 버튼 시 stop.
+        category: ui
+        implementation_notes:
+          - 단일 인스턴스 유지
+      - id: net-backoff
+        title: WS 재연결 정책
+        description: 로그인/대기 중에만 백오프 재연결, 녹화 중 재연결 금지.
+        category: ui
+        implementation_notes:
+          - 녹화 중 에러 시 중단 안내
+    dependencies:
+      - ui-applicant-flow
+      - ws-server-recording
+    completion_criteria:
+      - 5분 연속 녹화 손실 0
+      - 오류 시 사용자 안내 표시
+    risks:
+      - risk: 권한 거부/디바이스 불가
+        mitigation: 장치 설정 안내/대체 장치 선택 UI
+    order: 15
+  - id: api-interview-start-mark
+    title: 면접 시작/마킹 API
+    priority: P0
+    description: POST /api/interview/:token/start, POST /api/interview/:token/mark. 상태 전이 및 marks.json 업데이트, events 로그 기록.
+    files:
+      - path: /app/api/interview/[token]/start/route.ts
+        description: 면접 시작 핸들러
+        type: create
+      - path: /app/api/interview/[token]/mark/route.ts
+        description: 마킹 이벤트 수신
+        type: create
+    subtasks:
+      - id: start-transition
+        title: state=in_progress 전이
+        description: startedAt 기록, opening.start 기록.
+        category: api
+        implementation_notes:
+          - 현재 상태 유효성 검사
+      - id: mark-events
+        title: opening_end/q_start/q_end/timer_* 기록
+        description: marks.json 구조에 맞게 병합/저장.
+        category: data
+        implementation_notes:
+          - 타임스탬프 ISO8601/epoch 일관화(서버수신 기준)
+    dependencies:
+      - lib-supabase-adapter
+      - api-auth-applicant
+    completion_criteria:
+      - 유효 전이에서만 200, 상태충돌 409
+      - marks.json에 누락 없이 반영
+    risks:
+      - risk: 동시 마크로 인한 경쟁 상태
+        mitigation: ETag 체크/재시도 및 서버 측 직렬화
+    order: 16
+  - id: api-interview-stt
+    title: STT 수신/스크립트 병합 API
+    priority: P0
+    description: POST /api/interview/:token/stt. stt_raw 세그먼트 JSONL 업로드, scripts/q{n}.txt 갱신, combined.json 병합 및 coverage
+      계산(sttMs, 추정 voiceMs).
+    files:
+      - path: /app/api/interview/[token]/stt/route.ts
+        description: STT 이벤트 수신/저장
+        type: create
+    subtasks:
+      - id: stt-raw-seg
+        title: stt_raw 세그먼트 저장
+        description: 세그먼트 파일 logs/stt_raw/0001.jsonl 형태 누적 업로드.
+        category: data
+        implementation_notes:
+          - 세그먼트 최대 크기/라인수 제한
+      - id: script-merge
+        title: q별 스크립트/combined 병합
+        description: qid 경계로 최종 텍스트 파일 및 segments 생성/업데이트.
+        category: data
+        implementation_notes:
+          - isFinal 시 문장 경계 병합
+          - language 자동 감지 태그 유지
+      - id: coverage-calc
+        title: 커버리지 계산
+        description: sttMs 합산 및 음성 구간 추정(연속 세그먼트 간격/길이 기반)으로 voiceMs 근사, ratio 계산.
+        category: data
+        implementation_notes:
+          - finish 시 재계산로 보정
+    dependencies:
+      - lib-supabase-adapter
+      - api-interview-start-mark
+    completion_criteria:
+      - 각 질문별 q*.txt 존재
+      - combined.json segments 생성 및 coverage 필드 포함
+    risks:
+      - risk: Web Speech 미지원 브라우저
+        mitigation: 폴백 경로 구현 및 UI 공지
+    order: 17
+  - id: api-interview-finish
+    title: 면접 종료 처리(API finish + 리뮤즈 확인)
+    priority: P0
+    description: POST /api/interview/:token/finish. WS 종료 신호 이후 remux 완료 대기, 최종 아티팩트 존재 확인, state=completed 또는 error 전이.
+    files:
+      - path: /app/api/interview/[token]/finish/route.ts
+        description: 면접 종료 핸들러
+        type: create
+    subtasks:
+      - id: await-remux
+        title: remux 완료 동기화
+        description: FFmpeg 큐 완료 대기, 시간 초과 시 에러 처리.
+        category: api
+        implementation_notes:
+          - ffprobe 메타 파싱으로 무결성 체크
+      - id: finalize-status
+        title: 상태 전이 및 정리
+        description: completed/error 설정, 자원 해제 로그 기록.
+        category: data
+        implementation_notes:
+          - 결과 파일 존재성 검사(remuxed.webm)
+    dependencies:
+      - ws-server-recording
+      - api-interview-stt
+    completion_criteria:
+      - remuxed.webm 존재 및 재생 가능
+      - state=completed 설정, 오류 시 state=error
+    risks:
+      - risk: finish 시점과 WS 종료 순서 레이스
+        mitigation: 토큰별 락/상태머신으로 순서 보장
+    order: 18
+  - id: ui-admin-dashboard
+    title: 관리자 대시보드/상태 보드
+    priority: P1
+    description: /app/admin 구현. 라운드 CRUD, 지원자 등록/초대 발송, 상태 보드(미응시/진행중/중단됨/완료/오류), 필터/검색.
+    files:
+      - path: /app/admin/page.tsx
+        description: 대시보드 엔트리
+        type: create
+      - path: /components/admin/StatusBoard.tsx
+        description: 상태 보드 컴포넌트
+        type: create
+    subtasks:
+      - id: status-aggregate
+        title: 상태 집계 소스
+        description: candidates/*/status.json 스캔/집계 API 또는 서버 컴포넌트.
+        category: ui
+        implementation_notes:
+          - 폴더 목록 캐시
+      - id: actions-invite
+        title: 초대 발송/재발송 UI
+        description: send API 호출 및 결과 피드백.
+        category: ui
+        implementation_notes:
+          - 에러/반송 표시
+    dependencies:
+      - api-candidates-batch-invite
+      - api-get-candidate-summary
+    completion_criteria:
+      - 상태 보드가 최신 상태 반영(주기 새로고침)
+      - 초대 발송 동작/결과 표시
+    risks:
+      - risk: 대량 목록 조회 성능
+        mitigation: 페이지네이션/지연 로딩
+    order: 19
+  - id: api-admin-invitations-send
+    title: 초대 이메일 발송 API
+    priority: P1
+    description: POST /api/admin/invitations/send. 후보 토큰 배열로 메일 발송, 로그 기록.
+    files:
+      - path: /app/api/admin/invitations/send/route.ts
+        description: 초대 발송 핸들러
+        type: create
+    subtasks:
+      - id: deadline-vars
+        title: 템플릿 변수 처리
+        description: "{name, recruitmentName, linkUrl, pin, deadline, supportEmail}"
+        category: api
+        implementation_notes:
+          - 메일 큐 동시 처리 제한
+    dependencies:
+      - api-candidates-batch-invite
+    completion_criteria:
+      - 요청 대상 모두 발송 시 ok/실패 목록 반환
+      - events.jsonl에 발송 결과 기록
+    risks:
+      - risk: SMTP 한도 초과
+        mitigation: 레이트리밋 및 배치 크기 제한
+    order: 20
+  - id: api-admin-artifacts
+    title: 결과 아티팩트 목록 API
+    priority: P1
+    description: GET /api/admin/candidates/:token/artifacts. 재생/다운로드용 프록시 URL 목록 반환.
+    files:
+      - path: /app/api/admin/candidates/[token]/artifacts/route.ts
+        description: 아티팩트 조회 핸들러
+        type: create
+    subtasks:
+      - id: artifact-list
+        title: 파일 존재/종류 판별
+        description: interview/*, scripts/*, evaluation/* 목록화.
+        category: api
+        implementation_notes:
+          - 미디어/스크립트/로그 구분
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - 아티팩트 경로/타입 목록 반환
+    risks:
+      - risk: 직접 URL 노출 위험
+        mitigation: 모든 접근 서버 프록시 강제, 임시 서명 URL 미사용
+    order: 21
+  - id: ui-admin-results-viewer
+    title: 결과 열람 UI(영상+스크립트 동기화)
+    priority: P1
+    description: 관리자 결과 페이지에서 remuxed.webm 재생과 스크립트(segments) 동기화, 타임마커 점프.
+    files:
+      - path: /components/admin/ResultsViewer.tsx
+        description: 결과 열람 컴포넌트
+        type: create
+    subtasks:
+      - id: sync-script-video
+        title: 스크립트-영상 동기화
+        description: segments start/end 기준 하이라이트/점프, 오차 ≤1s.
+        category: ui
+        implementation_notes:
+          - 시간대비 색상 표시
+    dependencies:
+      - api-admin-artifacts
+    completion_criteria:
+      - 타임마커/스크립트 동기화 오차 ≤1s
+    risks:
+      - risk: 브라우저 미디어 싱크 이슈
+        mitigation: timeupdate 보정, 소수점 정밀도 처리
+    order: 22
+  - id: api-admin-eval-run
+    title: LLM 평가 실행/저장 API
+    priority: P1
+    description: POST /api/admin/eval/:token/run. 템플릿 로딩→OpenAI 호출→evaluation/result.json & report.pdf 저장.
+    files:
+      - path: /app/api/admin/eval/[token]/run/route.ts
+        description: 평가 실행 핸들러
+        type: create
+      - path: /lib/eval/openai.ts
+        description: OpenAI SDK 호출 유틸
+        type: create
+      - path: /lib/pdf/report.ts
+        description: pdfkit 기반 보고서 생성 유틸
+        type: create
+      - path: /config/prompts/templates.json
+        description: 평가 프롬프트 템플릿/버전
+        type: create
+    subtasks:
+      - id: prompt-compose
+        title: 프롬프트 구성
+        description: combined.json, marks.json, 질문 메타 기반. temperature 저온/결정론.
+        category: data
+        implementation_notes:
+          - promptVersion 기록
+      - id: pdf-generate
+        title: PDF 보고서 생성
+        description: 요약/점수 테이블/타임마커 링크 포함.
+        category: data
+        implementation_notes:
+          - UTF-8 폰트 임베드
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - result.json, report.pdf 저장
+      - 템플릿 변경 시 점수 변화 확인
+    risks:
+      - risk: LLM 응답 변동성
+        mitigation: temperature 낮춤, system 지시 강화, 재현성 메타 기록
+    order: 23
+  - id: api-interview-fallback-whisper
+    title: STT 폴백(Whisper) 일괄 변환
+    priority: P2
+    description: 브라우저 STT 미지원 시 질문 종료 후 오디오 demux→Whisper API로 변환→q{n}.txt 생성.
+    files:
+      - path: /lib/stt/whisper.ts
+        description: Whisper 폴백 유틸
+        type: create
+    subtasks:
+      - id: audio-demux
+        title: 오디오 추출
+        description: FFmpeg demux로 질문 구간 오디오 생성.
+        category: data
+        implementation_notes:
+          - marks.json 질문 경계 사용
+    dependencies:
+      - api-interview-stt
+      - ws-server-recording
+    completion_criteria:
+      - q별 텍스트 생성, combined.json 보강
+    risks:
+      - risk: API 비용/지연
+        mitigation: 관리자 트리거 기반 비동기 처리
+    order: 24
+  - id: logging-telemetry
+    title: 이벤트/오류 로깅(JSONL) 및 감사 추적
+    priority: P0
+    description: events.jsonl, error.jsonl 세그먼트 저장 및 중요한 상태 전이 로깅. 공통 로거 유틸.
+    files:
+      - path: /lib/logging/logger.ts
+        description: 표준 이벤트/에러 로거, 세그먼트 업로드
+        type: create
+    subtasks:
+      - id: log-spec
+        title: 로그 스키마 정의
+        description: "{ts,type,payload} 구조, 필수 이벤트 목록 지정."
+        category: core
+        implementation_notes:
+          - 민감정보 필터링(PIN 금지)
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - 핵심 이벤트가 JSONL로 저장되고 조회 가능
+    risks:
+      - risk: 자주 쓰기로 인한 비용 증가
+        mitigation: 세그먼트 배치/쓰로틀
+    order: 25
+  - id: security-policies
+    title: 보안/쿠키/HTTPS 정책 적용
+    priority: P0
+    description: HTTPS/HSTS 전제, 쿠키 보안 속성, Supabase 키 서버 보관, 관리자 영역 보호, 속도 제한.
+    files:
+      - path: /app/middleware.ts
+        description: 관리자 라우트 접근 제어/레이트리미트 적용(선택)
+        type: create
+    subtasks:
+      - id: cookie-flags
+        title: 쿠키 Secure/HttpOnly/SameSite
+        description: iron-session 정책 적용.
+        category: core
+        implementation_notes:
+          - 프로덕션에서만 Secure 강제
+    dependencies:
+      - lib-session-rate-limit
+    completion_criteria:
+      - 보안 검사 체크리스트 통과(HSTS, 쿠키 속성)
+    risks:
+      - risk: 개발 환경에서 HTTPS 미구성
+        mitigation: 로컬 개발 가이드 제공/프록시 사용
+    order: 26
+  - id: validators-and-errors
+    title: 요청 검증/표준 에러 포맷
+    priority: P0
+    description: 모든 API의 입력 검증 및 {ok:false, code, message, hint?} 형식 에러 표준화.
+    files:
+      - path: /lib/validators/schemas.ts
+        description: 스키마 추가/수정(전 API)
+        type: modify
+    subtasks:
+      - id: error-normalize
+        title: 에러 핸들러 유틸
+        description: HTTP 401/403/409/429/500 규약 준수.
+        category: api
+        implementation_notes:
+          - stack 숨김, code 매핑
+    dependencies:
+      - setup-env-structure
+    completion_criteria:
+      - 모든 API에서 스키마 미스매치 시 400 반환
+      - 에러 포맷 일관성 유지
+    risks:
+      - risk: 검증 누락으로 런타임 오류
+        mitigation: 테스트로 커버리지 확보
+    order: 27
+  - id: ui-accessibility
+    title: 접근성/키보드 내비/ARIA
+    priority: P2
+    description: 타이머 ARIA 라이브 영역, 대비 준수, 키보드 포커스 순서 검증.
+    files:
+      - path: /components/ui/A11yProvider.tsx
+        description: 접근성 헬퍼 컴포넌트
+        type: create
+    subtasks:
+      - id: aria-live
+        title: 타이머 ARIA 라이브
+        description: 카운트다운 변경 알림.
+        category: ui
+        implementation_notes:
+          - role=alert 적용
+    dependencies:
+      - ui-timer-worker
+    completion_criteria:
+      - 기본 접근성 검사 통과
+    risks:
+      - risk: 과도한 알림으로 사용자 피로
+        mitigation: 알림 빈도 제한
+    order: 28
+  - id: retention-and-integrity
+    title: 보존/무결성 점검/일괄 삭제 스크립트
+    priority: P2
+    description: retentionMonths 기반 삭제, 파일 존재/크기/해시 점검 스크립트.
+    files:
+      - path: /scripts/ops/retention-cleanup.ts
+        description: 보존기간 만료 삭제
+        type: create
+      - path: /scripts/ops/integrity-check.ts
+        description: 무결성 점검/보고
+        type: create
+    subtasks:
+      - id: ffprobe-check
+        title: 미디어 무결성(ffprobe)
+        description: 재생 불가 시 재리뮤즈 시도 후 실패 보고.
+        category: data
+        implementation_notes:
+          - 보고서 생성
+    dependencies:
+      - lib-supabase-adapter
+    completion_criteria:
+      - 만료 데이터 삭제 수행 로그
+      - 무결성 보고서 생성
+    risks:
+      - risk: 오삭제
+        mitigation: 드라이런 모드/보호 리스트
+    order: 29
+  - id: tests-e2e
+    title: 수용/성능/E2E 테스트
+    priority: P0
+    description: 인증, 타이머 정확도, 녹화/리뮤즈, STT, 종료, 상태보드, 평가 재현성, 네트워크 중단 등 수용 기준 검증.
+    files:
+      - path: /scripts/ops/test-plan.md
+        description: 테스트 계획 문서
+        type: create
+    subtasks:
+      - id: timer-accuracy-test
+        title: 타이머 정확도 측정
+        description: ±0.2s 내 검증 절차.
+        category: test
+        implementation_notes:
+          - performance.now 기반 측정
+      - id: network-interrupt-test
+        title: WS 중단 시 파일 보존
+        description: 세션 강제 종료 후 상태=interrupted 확인.
+        category: test
+        implementation_notes:
+          - sttRaw 세그먼트 유실 0 확인
+    dependencies:
+      - ui-timer-worker
+      - ws-server-recording
+      - api-interview-stt
+      - api-interview-finish
+    completion_criteria:
+      - 수용 기준 전 항목 통과 보고서 작성
+    risks:
+      - risk: 브라우저 자동화 한계
+        mitigation: 수동/반자동 혼합 계획
+    order: 30
+implementation_guides:
+  - id: paths-and-naming
+    title: 경로/네이밍 규칙
+    category: 아키텍처
+    content: 모든 후보 데이터는 Supabase Storage recruitments/{recruitmentId}/candidates/{token}/ 하위에 저장. 파일 접두는 candidateToken_을
+      적용. 토큰은 [A-Za-z0-9]{10}. JSON은 UTF-8, 마지막 개행 포함. JSONL은 1줄 1객체, UTC ISO8601 ts 사용.
+    related_tasks:
+      - lib-supabase-adapter
+      - api-interview-stt
+      - ws-server-recording
+  - id: atomic-writes
+    title: 원자적 쓰기/세그먼트 append 패턴
+    category: 데이터처리
+    content: 모든 쓰기는 .tmp 경로 업로드→무결성 검증(sha256,size)→move(final). append가 필요한 로그/STT는 logs/{type}/NNNN.jsonl 세그먼트로 업로드한 뒤,
+      finish 시 머지하여 단일 파일로 컨솔리데이션.
+    related_tasks:
+      - lib-supabase-adapter
+      - logging-telemetry
+      - api-interview-stt
+  - id: ws-binary-protocol
+    title: WS 바이너리 프로토콜/흐름 제어
+    category: 성능
+    content: 최초 메시지는 JSON 헤더, 이후 순수 바이너리 청크(1s). 서버는 백프레셔 감지 시 경고 로그. 녹화 중 재연결 금지. 세션 종료 시 remux 큐에 작업 등록 후 업로드, 로컬 tmp 삭제.
+    related_tasks:
+      - ws-server-recording
+      - media-recorder-client
+  - id: stt-merge-combined
+    title: STT 병합/combined.json 생성
+    category: 데이터처리
+    content: STT 이벤트는 qid 경계로 누적. isFinal=true 시 문장 경계로 병합하고 segments[{qid,start,end,text}] 생성. coverage.sttMs는 segments 길이
+      합. coverage.voiceMs는 인접 세그먼트 간격과 지속시간 기반 근사 후 finish 시 보정.
+    related_tasks:
+      - api-interview-stt
+      - api-interview-fallback-whisper
+  - id: marks-and-timer
+    title: marks.json/timer 로깅
+    category: 사용자경험
+    content: timer_start/timer_end 이벤트로 {qid,start,end,durationMs} 기록. opening, questions[{id,start,end}]을 함께 유지. media
+      메타(ffprobe 결과) 업데이트.
+    related_tasks:
+      - api-interview-start-mark
+      - ui-timer-worker
+      - api-interview-finish
+  - id: security-hardening
+    title: 보안/인증/권한 가이드
+    category: 보안
+    content: 세션 쿠키 Secure/HttpOnly/SameSite=Lax. /admin/* 은 관리자 세션만, /api/interview/* 은 해당 applicant 세션만. 로그에 PIN 평문 금지.
+      HSTS 활성화. 레이트리미트 10req/min 기본.
+    related_tasks:
+      - security-policies
+      - api-auth-applicant
+      - api-auth-admin
+  - id: error-handling-standard
+    title: 에러 포맷/코드 규약
+    category: 아키텍처
+    content: JSON 에러는 {ok:false, code:"ERR_xxx", message, hint?}. 429 rate limit, 401/403 인증/권한, 409 상태충돌, 500 내부 오류를 일관 반환.
+    related_tasks:
+      - validators-and-errors
+  - id: retention-ops
+    title: 보존/삭제 운영 가이드
+    category: 운영
+    content: recruitments/{id}/meta.retentionMonths를 기준으로 만료 데이터 일괄 삭제. 삭제 전 무결성 점검 보고. 관리자 승인 후 실행.
+    related_tasks:
+      - retention-and-integrity
+execution_order:
+  summary: 핵심 공통 라이브러리와 스토리지 어댑터를 먼저 구축하고, 인증/리소스 생성 API를 구현한 후 지원자 UI/타이머/미디어 파이프라인(WS+FFmpeg)을 연결한다. 이후 STT 파이프라인과 종료
+    처리, 관리자 대시보드/결과 열람, 평가/보고서, 로깅/보안/운영 스크립트를 순차 통합한다. 최종적으로 수용/성능/E2E 테스트를 통과한다.
+  phases:
+    - phase_name: 기반 설정
+      task_ids:
+        - setup-env-structure
+        - lib-supabase-adapter
+        - lib-crypto-identifiers
+        - lib-session-rate-limit
+        - validators-and-errors
+      description: 환경/스토리지/식별자/세션/검증의 공통 기반을 구축.
+    - phase_name: 인증/리소스 초기 API
+      task_ids:
+        - api-auth-applicant
+        - api-auth-admin
+        - api-recruitments-create-upload
+        - api-candidates-batch-invite
+        - api-get-recruitment
+        - api-get-candidate-summary
+        - api-candidate-individual-question
+      description: 로그인 및 채용/지원자 리소스 생성/조회/이메일 발송을 구현.
+    - phase_name: 지원자 UI/타이머
+      task_ids:
+        - ui-applicant-flow
+        - ui-timer-worker
+      description: 지원자 화면 흐름과 정확한 타이머를 구현.
+    - phase_name: 미디어 파이프라인
+      task_ids:
+        - ws-server-recording
+        - media-recorder-client
+      description: 연속 녹화와 WS 전송, FFmpeg remux 업로드를 연결.
+    - phase_name: STT/마킹/종료
+      task_ids:
+        - api-interview-start-mark
+        - api-interview-stt
+        - api-interview-finish
+      description: STT 수신/병합과 marks 기록, 종료 처리/무결성 확인.
+    - phase_name: 관리자 대시보드/아티팩트
+      task_ids:
+        - ui-admin-dashboard
+        - api-admin-invitations-send
+        - api-admin-artifacts
+        - ui-admin-results-viewer
+      description: 상태 보드와 결과 열람을 제공.
+    - phase_name: 평가/레포트
+      task_ids:
+        - api-admin-eval-run
+        - api-interview-fallback-whisper
+      description: LLM 평가/보고서와 STT 폴백을 통합.
+    - phase_name: 로깅/보안/운영
+      task_ids:
+        - logging-telemetry
+        - security-policies
+        - retention-and-integrity
+      description: 감사 로그/보안 정책/보존 작업 정비.
+    - phase_name: 테스트/검증
+      task_ids:
+        - tests-e2e
+      description: 수용 기준 전 항목 테스트 및 성능 검증을 완료.
